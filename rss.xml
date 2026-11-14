@@ -1,0 +1,550 @@
+<?xml version="1.0" encoding="UTF-8"?><?xml-stylesheet href="/scripts/pretty-feed-v3.xsl" type="text/xsl"?><rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:h="http://www.w3.org/TR/html4/"><channel><title>博客</title><description>Engineering notes · Linux · tools</description><link>https://yuzhishuo.github.io</link><item><title>Linux 中断咬尾：硬件尾链、irq_exit 与同线 PENDING</title><link>https://yuzhishuo.github.io/blog/linux-irq-tail-chaining</link><guid isPermaLink="true">https://yuzhishuo.github.io/blog/linux-irq-tail-chaining</guid><description>硬件 Tail-chaining、irq_exit 上的 softirq、同线 IRQS_PENDING——三条常被混在一起的「咬尾」</description><pubDate>Sun, 13 Sep 2026 00:00:00 GMT</pubDate><content:encoded>&lt;section class=&quot;notion-callout color-blue_background&quot;&gt;&lt;div class=&quot;notion-callout-icon&quot;&gt;🦷&lt;/div&gt;&lt;div class=&quot;notion-callout-content&quot;&gt;这篇只聊「咬尾」三个常被混在一起的机制：硬件 Tail-chaining、Linux 在 &lt;code&gt;irq_exit&lt;/code&gt; 尾巴上跑 softirq、以及同一条 IRQ 的 &lt;code&gt;IRQS_PENDING&lt;/code&gt; 循环。对照 &lt;code&gt;linux-source-7.0.0&lt;/code&gt;。不讲抢占模型和实时补丁。&lt;/div&gt;&lt;/section&gt;&lt;hr&gt;&lt;h2 id=&quot;0-先把词拆开&quot;&gt;0. 先把词拆开&lt;/h2&gt;&lt;p&gt;「咬尾」听起来像一件事，内核和芯片资料里至少有三条尾巴：&lt;/p&gt;&lt;table&gt;&lt;tbody&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;名字&lt;/th&gt;&lt;td&gt;谁在咬&lt;/td&gt;&lt;td&gt;咬的是什么&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;硬件 Tail-chaining&lt;/th&gt;&lt;td&gt;NVIC / 部分 IRQ 控制器&lt;/td&gt;&lt;td&gt;上一个 ISR 的&lt;b&gt;出栈&lt;/b&gt;，直接接下一个 ISR&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;&lt;code&gt;irq_exit&lt;/code&gt; 尾巴&lt;/th&gt;&lt;td&gt;Linux 软件&lt;/td&gt;&lt;td&gt;硬中断返回前，把 pending 的 &lt;b&gt;softirq&lt;/b&gt; 跑完&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;同线 PENDING 循环&lt;/th&gt;&lt;td&gt;genirq flow handler&lt;/td&gt;&lt;td&gt;这条线处理当中又来了一次，&lt;b&gt;不回任务&lt;/b&gt;接着处理&lt;/td&gt;&lt;/tr&gt;&lt;/tbody&gt;&lt;/table&gt;&lt;p&gt;还有一个英文长得很像的：&lt;code&gt;chained_irq_enter()&lt;/code&gt;。那是 &lt;b&gt;GPIO/PCIe 级联中断控制器&lt;/b&gt;，父 IRQ 的 handler 里再分发子 IRQ，不是咬尾。文末会把它划出去。&lt;/p&gt;&lt;p&gt;直觉可以记成：&lt;/p&gt;&lt;blockquote&gt;&lt;b&gt;硬件咬尾省的是进/出栈；软件咬尾省的是「先回任务再进来」这一趟。两者都让 CPU 在中断世界里多待一会儿。&lt;/b&gt;&lt;/blockquote&gt;&lt;hr&gt;&lt;h2 id=&quot;1-硬件咬尾别急着出栈&quot;&gt;1. 硬件咬尾：别急着出栈&lt;/h2&gt;&lt;p&gt;以 Cortex-M 的 NVIC 为例（ARMv7-M / ARMv8-M 手册里的 Tail-chaining）。&lt;/p&gt;&lt;p&gt;一次完整中断大约是：&lt;/p&gt;&lt;pre&gt;&lt;code class=&quot;language-plain text&quot;&gt;入栈（R0–R3, R12, LR, PC, xPSR）
+        ↓
+取向量、跑 ISR
+        ↓
+出栈，回到被打断的代码&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;如果 ISR 正要出栈时，&lt;b&gt;已经有另一个 IRQ pending&lt;/b&gt;，NVIC 可以：&lt;/p&gt;&lt;ul&gt;&lt;li&gt;不出栈；&lt;/li&gt;&lt;li&gt;也不再入一次栈；&lt;/li&gt;&lt;li&gt;改写 PC 到新向量，直接进下一个 ISR。&lt;/li&gt;&lt;/ul&gt;&lt;p&gt;这就是 Tail-chaining。省掉的是两次寄存器压弹，不是省掉 ISR 本身。&lt;/p&gt;&lt;p&gt;和&lt;b&gt;中断嵌套&lt;/b&gt;不是一回事：&lt;/p&gt;&lt;table&gt;&lt;tbody&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;&lt;/th&gt;&lt;td&gt;嵌套&lt;/td&gt;&lt;td&gt;咬尾&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;时机&lt;/th&gt;&lt;td&gt;A 还在跑，更高优先级 B 闯进来&lt;/td&gt;&lt;td&gt;A &lt;b&gt;已经跑完&lt;/b&gt;，返回路上发现 B 在等&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;栈&lt;/th&gt;&lt;td&gt;再压一层，A 的现场还在&lt;/td&gt;&lt;td&gt;不压新层，复用当前异常帧&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;谁先结束&lt;/th&gt;&lt;td&gt;B 先结束，再回 A&lt;/td&gt;&lt;td&gt;A 已经结束，接着跑 B&lt;/td&gt;&lt;/tr&gt;&lt;/tbody&gt;&lt;/table&gt;&lt;p&gt;GIC（ARM64 服务器/手机常见）没有 Cortex-M 那种同名 Tail-chaining 硬件捷径。它靠 EOI / 优先级抢占 / 再取中断。软件看起来像「退出一个 IRQ 马上又进下一个」，但是否省栈取决于架构入口，不要把 NVIC 的图硬套到 GIC 上。&lt;/p&gt;&lt;hr&gt;&lt;h2 id=&quot;2-linux-的软件尾巴irq_exit-里跑-softirq&quot;&gt;2. Linux 的软件尾巴：&lt;code&gt;irq_exit&lt;/code&gt; 里跑 softirq&lt;/h2&gt;&lt;p&gt;架构入口（通用路径）是一对括号：&lt;/p&gt;&lt;pre&gt;&lt;code class=&quot;language-c&quot;&gt;/* kernel/irq/handle.c */
+irq_enter();
+handle_arch_irq(regs);   /* 分发到具体 irq_desc */
+irq_exit();&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;&lt;code&gt;irq_enter()&lt;/code&gt; 把 &lt;code&gt;preempt_count&lt;/code&gt; 的 HARDIRQ 域抬起来，标记「现在在硬中断里」。&lt;/p&gt;&lt;p&gt;&lt;code&gt;irq_exit()&lt;/code&gt; 才是咬尾发生的地方。减掉 HARDIRQ 之后，若已经不在任何中断上下文、且本 CPU 有 pending softirq，就当场调用 &lt;code&gt;invoke_softirq()&lt;/code&gt;：&lt;/p&gt;&lt;pre&gt;&lt;code class=&quot;language-c&quot;&gt;/* kernel/softirq.c */
+account_hardirq_exit(current);
+preempt_count_sub(HARDIRQ_OFFSET);
+if (!in_interrupt() &amp;#x26;&amp;#x26; local_softirq_pending())
+    invoke_softirq();&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;&lt;code&gt;in_interrupt()&lt;/code&gt; 为真时不跑：说明还套在另一层硬中断或 softirq 里，尾巴要留给最外层那次 &lt;code&gt;irq_exit&lt;/code&gt;。这避免 softirq 重入把自己绕死。&lt;/p&gt;&lt;p&gt;非嵌套返回时，默认实现常常是在 &lt;b&gt;irq 栈上直接 &lt;/b&gt;&lt;b&gt;&lt;code&gt;__do_softirq()&lt;/code&gt;&lt;/b&gt;。于是时间线变成：&lt;/p&gt;&lt;pre&gt;&lt;code class=&quot;language-plain text&quot;&gt;硬中断 handler 返回
+        ↓
+你以为要回到被打断的任务
+        ↓
+irq_exit 发现 NET_RX / TIMER / … pending
+        ↓
+就在这条返回路上把 softirq 跑一圈
+        ↓
+这才真正回到任务&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;softirq 自己还会咬自己的尾巴。&lt;code&gt;handle_softirqs()&lt;/code&gt; 跑完一轮后若又有 pending：&lt;/p&gt;&lt;ul&gt;&lt;li&gt;没超过约 2ms（&lt;code&gt;MAX_SOFTIRQ_TIME&lt;/code&gt;）；&lt;/li&gt;&lt;li&gt;且 &lt;code&gt;need_resched()&lt;/code&gt; 为假；&lt;/li&gt;&lt;li&gt;且重启次数不到 10（&lt;code&gt;MAX_SOFTIRQ_RESTART&lt;/code&gt;）；&lt;/li&gt;&lt;/ul&gt;&lt;p&gt;就 &lt;code&gt;goto restart&lt;/code&gt; 再来一轮。撑不住了才 &lt;code&gt;wakeup_softirqd()&lt;/code&gt;，把剩余工作丢给 &lt;code&gt;ksoftirqd&lt;/code&gt;。&lt;/p&gt;&lt;p&gt;注释写得很直：尽快处理 softirq，但别让它把机器锁死。延迟和公平在这里对拉。&lt;/p&gt;&lt;section class=&quot;notion-callout color-gray_background&quot;&gt;&lt;div class=&quot;notion-callout-icon&quot;&gt;🧠&lt;/div&gt;&lt;div class=&quot;notion-callout-content&quot;&gt;所以很多人骂的「中断延迟」，有一半其实不是 handler 本身，而是 &lt;b&gt;handler 返回之后、回到任务之前&lt;/b&gt; 那截 softirq 尾巴。网卡硬中断可能只有几微秒，尾巴上的 &lt;code&gt;NET_RX_SOFTIRQ&lt;/code&gt; 却可能把协议栈跑很久。&lt;/div&gt;&lt;/section&gt;&lt;hr&gt;&lt;h2 id=&quot;3-同线再来一次irqs_pending-循环&quot;&gt;3. 同线再来一次：&lt;code&gt;IRQS_PENDING&lt;/code&gt; 循环&lt;/h2&gt;&lt;p&gt;第二条软件咬尾发生在 &lt;b&gt;同一条 IRQ 线&lt;/b&gt; 上，不经过 &lt;code&gt;irq_exit&lt;/code&gt;。&lt;/p&gt;&lt;p&gt;边沿中断的 flow handler &lt;code&gt;handle_edge_irq()&lt;/code&gt;：&lt;/p&gt;&lt;pre&gt;&lt;code class=&quot;language-c&quot;&gt;do {
+    if (desc-&gt;istate &amp;#x26; IRQS_PENDING)
+        /* 处理当中被 mask 过，必要时 unmask */
+    handle_irq_event(desc);
+} while ((desc-&gt;istate &amp;#x26; IRQS_PENDING) &amp;#x26;&amp;#x26; !irqd_irq_disabled(&amp;#x26;desc-&gt;irq_data));&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;&lt;code&gt;handle_irq_event()&lt;/code&gt; 进门会清掉 &lt;code&gt;IRQS_PENDING&lt;/code&gt;，再标 &lt;code&gt;IRQD_IRQ_INPROGRESS&lt;/code&gt;，放开 &lt;code&gt;desc-&gt;lock&lt;/code&gt; 去跑 &lt;code&gt;action-&gt;handler&lt;/code&gt;。&lt;/p&gt;&lt;p&gt;这段窗口里如果硬件又来一次：&lt;/p&gt;&lt;ul&gt;&lt;li&gt;控制器可能已经 ack，新边沿还是会进来；&lt;/li&gt;&lt;li&gt;若看到 INPROGRESS，genirq 把这次记成 &lt;code&gt;IRQS_PENDING&lt;/code&gt;，而不是立刻重入 handler；&lt;/li&gt;&lt;li&gt;handler 回来后，&lt;code&gt;while&lt;/code&gt; 发现 PENDING 还在，接着跑下一轮。&lt;/li&gt;&lt;/ul&gt;&lt;p&gt;注释原话：handling 期间到达的边沿，要在离开循环前处理完。&lt;/p&gt;&lt;p&gt;电平中断一般是 mask → 处理 → 再 unmask，不靠这种 do-while。&lt;code&gt;handle_fasteoi_irq()&lt;/code&gt; 在处理完后若发现 PENDING，走 &lt;code&gt;check_irq_resend()&lt;/code&gt; 重投，而不是就地循环。&lt;/p&gt;&lt;p&gt;关键字段：&lt;/p&gt;&lt;table&gt;&lt;tbody&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;字段&lt;/th&gt;&lt;td&gt;在哪&lt;/td&gt;&lt;td&gt;咬尾时干什么&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;&lt;code&gt;desc-&gt;istate&lt;/code&gt; 的 &lt;code&gt;IRQS_PENDING&lt;/code&gt;&lt;/th&gt;&lt;td&gt;&lt;code&gt;irq_desc&lt;/code&gt;&lt;/td&gt;&lt;td&gt;「这条线还有一次没消化」&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;&lt;code&gt;IRQD_IRQ_INPROGRESS&lt;/code&gt;&lt;/th&gt;&lt;td&gt;&lt;code&gt;irq_data&lt;/code&gt;&lt;/td&gt;&lt;td&gt;handler 正在跑，新来的先记 PENDING&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;&lt;code&gt;desc-&gt;lock&lt;/code&gt;&lt;/th&gt;&lt;td&gt;&lt;code&gt;raw_spinlock_t&lt;/code&gt;&lt;/td&gt;&lt;td&gt;flow 与 handler 之间的交接锁&lt;/td&gt;&lt;/tr&gt;&lt;/tbody&gt;&lt;/table&gt;&lt;hr&gt;&lt;h2 id=&quot;4-三次返回三种尾巴&quot;&gt;4. 三次返回，三种尾巴&lt;/h2&gt;&lt;p&gt;把一次设备中断从外到内摊开：&lt;/p&gt;&lt;pre&gt;&lt;code class=&quot;language-plain text&quot;&gt;任务正在跑
+    │
+    ├─ 硬件：可能 Tail-chain（上一个 ISR 出栈被吃掉）
+    │
+    ├─ irq_enter
+    │     handle_edge_irq  do-while     ← 同线 PENDING，还不离开硬中断
+    │     handle_irq_event
+    │         action-&gt;handler
+    │
+    └─ irq_exit
+          HARDIRQ count 降到 0
+          invoke_softirq / __do_softirq  ← 软件咬尾：softirq
+          （softirq 内部还可能 restart 最多 10 次）
+    回到任务&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;三层独立：硬件省栈、同线不回任务、softirq 占用返回路径。查延迟时要问：慢在 ISR、慢在 PENDING 循环，还是慢在 &lt;code&gt;irq_exit&lt;/code&gt; 之后。&lt;/p&gt;&lt;hr&gt;&lt;h2 id=&quot;5-级联-irq-不是咬尾&quot;&gt;5. 级联 IRQ 不是咬尾&lt;/h2&gt;&lt;p&gt;GPIO、PCIe MSI 分发常用 &lt;code&gt;chained_irq_enter()&lt;/code&gt; / &lt;code&gt;chained_irq_exit()&lt;/code&gt;（&lt;code&gt;include/linux/irqchip/chained_irq.h&lt;/code&gt;）。&lt;/p&gt;&lt;p&gt;父中断的 handler 里：&lt;/p&gt;&lt;ol&gt;&lt;li&gt;读控制器「哪条子线」；&lt;/li&gt;&lt;li&gt;&lt;code&gt;generic_handle_irq()&lt;/code&gt; 走进子 &lt;code&gt;irq_desc&lt;/code&gt;；&lt;/li&gt;&lt;li&gt;退出时 EOI 或 unmask 父线。&lt;/li&gt;&lt;/ol&gt;&lt;p&gt;这是&lt;b&gt;一棵中断树&lt;/b&gt;，不是「ISR 返回路上接下一个」。英文 chained 容易和 Tail-chaining 撞车，中文最好叫「级联」，不要叫咬尾。&lt;/p&gt;&lt;hr&gt;&lt;h2 id=&quot;6-容易想错的点&quot;&gt;6. 容易想错的点&lt;/h2&gt;&lt;table&gt;&lt;tbody&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;误解&lt;/th&gt;&lt;td&gt;实际&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;咬尾 = 中断嵌套&lt;/th&gt;&lt;td&gt;嵌套发生在 ISR 还在跑；咬尾发生在 ISR 已经结束的返回路上&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;所有 SoC 都有 NVIC 那种省栈咬尾&lt;/th&gt;&lt;td&gt;那是 Cortex-M 的捷径；GIC 上要另看 EOI 和入口代码&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;handler 返回 = 中断结束&lt;/th&gt;&lt;td&gt;还可能在同线循环里，然后 &lt;code&gt;irq_exit&lt;/code&gt; 再跑 softirq&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;softirq 会在嵌套硬中断里立刻跑&lt;/th&gt;&lt;td&gt;&lt;code&gt;!in_interrupt()&lt;/code&gt; 拦住了，留给最外层 &lt;code&gt;irq_exit&lt;/code&gt;&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;PENDING 循环没有上限&lt;/th&gt;&lt;td&gt;边沿风暴时循环可以很长；softirq 那边至少有 2ms / 10 次刹车&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;&lt;code&gt;chained_irq_*&lt;/code&gt; 就是 Tail-chaining&lt;/th&gt;&lt;td&gt;那是级联分发，不是省栈咬尾&lt;/td&gt;&lt;/tr&gt;&lt;/tbody&gt;&lt;/table&gt;&lt;hr&gt;&lt;h2 id=&quot;7-源码地图&quot;&gt;7. 源码地图&lt;/h2&gt;&lt;ol&gt;&lt;li&gt;&lt;code&gt;kernel/irq/handle.c&lt;/code&gt; — &lt;code&gt;generic_handle_arch_irq&lt;/code&gt;：&lt;code&gt;irq_enter&lt;/code&gt; / &lt;code&gt;irq_exit&lt;/code&gt; 括号；&lt;code&gt;handle_irq_event&lt;/code&gt; 清 PENDING&lt;/li&gt;&lt;li&gt;&lt;code&gt;kernel/softirq.c&lt;/code&gt; — &lt;code&gt;__irq_exit_rcu&lt;/code&gt;、&lt;code&gt;invoke_softirq&lt;/code&gt;、&lt;code&gt;handle_softirqs&lt;/code&gt; 的 restart 上限&lt;/li&gt;&lt;li&gt;&lt;code&gt;kernel/irq/chip.c&lt;/code&gt; — &lt;code&gt;handle_edge_irq&lt;/code&gt; 的 do-while；&lt;code&gt;handle_fasteoi_irq&lt;/code&gt; 的 resend&lt;/li&gt;&lt;li&gt;&lt;code&gt;kernel/irq/internals.h&lt;/code&gt; — &lt;code&gt;IRQS_PENDING&lt;/code&gt;&lt;/li&gt;&lt;li&gt;&lt;code&gt;include/linux/irqchip/chained_irq.h&lt;/code&gt; — 级联，不是咬尾&lt;/li&gt;&lt;li&gt;ARMv7-M ARM：Exception handling / Tail-chaining（硬件语义）&lt;/li&gt;&lt;/ol&gt;&lt;hr&gt;&lt;blockquote&gt;&lt;b&gt;本篇带走一句话：咬尾就是「中断世界还没把 CPU 还给任务」——硬件省一次栈，同线 PENDING 再跑一轮 handler，&lt;/b&gt;&lt;b&gt;&lt;code&gt;irq_exit&lt;/code&gt;&lt;/b&gt;&lt;b&gt; 再把 softirq 接在返回路上。&lt;/b&gt;&lt;/blockquote&gt;</content:encoded></item><item><title>PI / boost：优先级继承与临时提权</title><link>https://yuzhishuo.github.io/blog/linux-pi-boost</link><guid isPermaLink="true">https://yuzhishuo.github.io/blog/linux-pi-boost</guid><description>优先级反转、PI 继承与 boost：带图说明 H/L/M 三人和锁链</description><pubDate>Sun, 13 Sep 2026 00:00:00 GMT</pubDate><content:encoded>&lt;section class=&quot;notion-callout color-gray_background&quot;&gt;&lt;div class=&quot;notion-callout-icon&quot;&gt;📌&lt;/div&gt;&lt;div class=&quot;notion-callout-content&quot;&gt;这篇讲一件事：高优先级的人等一把被低优先级拿着的锁时，内核怎么临时把优先级借给拿锁的人，免得被中间那档卡住。读完不需要对着源码。四个优先级字段见 。权重见 。&lt;/div&gt;&lt;/section&gt;&lt;blockquote&gt;判断正在被抬高：生效优先级和自己的稳态优先级不一样。放锁之后两者重新相等。&lt;/blockquote&gt;&lt;hr&gt;&lt;h2 id=&quot;相关&quot;&gt;相关&lt;/h2&gt;&lt;ul&gt;&lt;li&gt;四个优先级字段：&lt;/li&gt;&lt;li&gt;为什么不能只指向锁：&lt;span class=&quot;notion-page-ref&quot; data-notion-page=&quot;20ca6eafe68d8294b1fc010f0f6d9a58&quot;&gt;blocked_on 与 PI 字段：为什么不能只指向锁&lt;/span&gt;&lt;/li&gt;&lt;li&gt;静态权重（boost 不改它）：&lt;/li&gt;&lt;li&gt;PELT 负载跟踪：&lt;/li&gt;&lt;li&gt;类间谁先被问：&lt;/li&gt;&lt;/ul&gt;&lt;hr&gt;&lt;h2 id=&quot;1-先问对问题高的人为什么会一直等&quot;&gt;1. 先问对问题：高的人为什么会一直等&lt;/h2&gt;&lt;p&gt;三个角色，一把锁：&lt;/p&gt;&lt;ul&gt;&lt;li&gt;&lt;b&gt;H 高&lt;/b&gt;：实时任务，FIFO 50。要进临界区。&lt;/li&gt;&lt;li&gt;&lt;b&gt;L 低&lt;/b&gt;：普通任务，nice 0。已经拿着这把锁。&lt;/li&gt;&lt;li&gt;&lt;b&gt;M 中&lt;/b&gt;：也不用这把锁，nice -5，比 L 更能抢 CPU。&lt;/li&gt;&lt;/ul&gt;&lt;p&gt;没有优先级继承时，故事是这样的：&lt;u&gt;L 进了临界区。H 来了，发现锁被占着，只能睡。M 不碰这把锁，却一直跑。L 被 M 挤掉，放不了锁。H 明明最高，反而要等 M 跑完。&lt;/u&gt;&lt;/p&gt;&lt;p&gt;这就叫 &lt;b&gt;优先级反转&lt;/b&gt;：不是 H 直接输给 L，而是被中间那档间接堵住了。&lt;/p&gt;&lt;div class=&quot;notion-image with-caption&quot;&gt;&lt;img __ASTRO_IMAGE_=&quot;{&amp;#x22;src&amp;#x22;:&amp;#x22;../../assets/images/notion/2fd78e46-6727-4027-8aef-ce34d858a8dd/42f5dd2c-2fb9-42f5-a1d9-24ab96d0cdc1.png&amp;#x22;,&amp;#x22;data-notion-file-type&amp;#x22;:&amp;#x22;file&amp;#x22;,&amp;#x22;index&amp;#x22;:0}&quot;&gt;&lt;div class=&quot;notion-caption&quot;&gt;图1 优先级反转：高的人反而一直等&lt;/div&gt;&lt;/div&gt;&lt;p&gt;可以把它想成：VIP 要进一间被清洁工占用的房间。走廊里一个实习生一直走来走去，清洁工插不进队，门就一直锁着。VIP 不是输给清洁工，是输给那个不关门、却占着路的人。&lt;/p&gt;&lt;hr&gt;&lt;h2 id=&quot;2-办法把高的优先级临时借给拿锁的人&quot;&gt;2. 办法：把高的优先级临时借给拿锁的人&lt;/h2&gt;&lt;p&gt;协议叫 &lt;b&gt;PI&lt;/b&gt;（Priority Inheritance，优先级继承）。做法很直白：谁拿着锁挡住了更高的人，就临时按那个更高的人来调度，好尽快做完临界区、放锁。&lt;/p&gt;&lt;p&gt;H 堵在 L 的锁上，就把 H 的生效优先级借给 L。L 暂时压过 M，跑完、放锁，H 才能进。借的是「此刻拿去选人的那个数」，不是把 L 改成实时任务。&lt;/p&gt;&lt;div class=&quot;notion-image with-caption&quot;&gt;&lt;img __ASTRO_IMAGE_=&quot;{&amp;#x22;src&amp;#x22;:&amp;#x22;../../assets/images/notion/2fd78e46-6727-4027-8aef-ce34d858a8dd/1812aa85-3a00-4334-aa7e-510f2d88db9e.png&amp;#x22;,&amp;#x22;data-notion-file-type&amp;#x22;:&amp;#x22;file&amp;#x22;,&amp;#x22;index&amp;#x22;:0}&quot;&gt;&lt;div class=&quot;notion-caption&quot;&gt;图2 优先级继承：把 H 的优先级临时借给 L&lt;/div&gt;&lt;/div&gt;&lt;p&gt;两个词不要混：&lt;/p&gt;&lt;table&gt;&lt;tbody&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;&lt;/th&gt;&lt;td&gt;PI&lt;/td&gt;&lt;td&gt;boost&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;是什么&lt;/th&gt;&lt;td&gt;协议：等锁的人把优先级借给拿锁的人&lt;/td&gt;&lt;td&gt;动作：把借来的数写进生效优先级&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;什么时候发生&lt;/th&gt;&lt;td&gt;有人堵在这把锁上&lt;/td&gt;&lt;td&gt;拿锁的人生效优先级真的变了&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;什么时候结束&lt;/th&gt;&lt;td&gt;锁被放开，或等锁的人走了&lt;/td&gt;&lt;td&gt;de-boost：生效值掉回自己的稳态&lt;/td&gt;&lt;/tr&gt;&lt;/tbody&gt;&lt;/table&gt;&lt;p&gt;用户态常见入口：&lt;code&gt;pthread_mutex&lt;/code&gt; 设成 &lt;code&gt;PTHREAD_PRIO_INHERIT&lt;/code&gt;。内核里对应的是带 PI 的 &lt;code&gt;futex / rt_mutex&lt;/code&gt;。&lt;code&gt;PREEMPT_RT&lt;/code&gt; 下，连不少自旋锁、普通 &lt;code&gt;mutex&lt;/code&gt; 也会走这套。&lt;/p&gt;&lt;hr&gt;&lt;h2 id=&quot;3-两本账身份不动生效值临时变小&quot;&gt;3. 两本账：身份不动，生效值临时变小&lt;/h2&gt;&lt;p&gt;一个任务身上同时挂着「我是谁」和「此刻调度器拿我当谁」。boost 只改后者。&lt;/p&gt;&lt;div class=&quot;notion-image with-caption&quot;&gt;&lt;img __ASTRO_IMAGE_=&quot;{&amp;#x22;src&amp;#x22;:&amp;#x22;../../assets/images/notion/2fd78e46-6727-4027-8aef-ce34d858a8dd/2f2b88a6-08d6-4881-ac45-745cb6fd2a29.png&amp;#x22;,&amp;#x22;data-notion-file-type&amp;#x22;:&amp;#x22;file&amp;#x22;,&amp;#x22;index&amp;#x22;:0}&quot;&gt;&lt;div class=&quot;notion-caption&quot;&gt;图3 两本账：身份不动，生效值临时变小&lt;/div&gt;&lt;/div&gt;&lt;table&gt;&lt;tbody&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;字段&lt;/th&gt;&lt;td&gt;稳态&lt;/td&gt;&lt;td&gt;boost 期间&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;&lt;code&gt;policy / nice / static_prio&lt;/code&gt;&lt;/th&gt;&lt;td&gt;自己的&lt;/td&gt;&lt;td&gt;不变&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;&lt;code&gt;se.load&lt;/code&gt;（CFS 份额）&lt;/th&gt;&lt;td&gt;由 &lt;code&gt;nice&lt;/code&gt; 推出&lt;/td&gt;&lt;td&gt;不变，也不走改权重那条路&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;&lt;code&gt;normal_prio&lt;/code&gt;&lt;/th&gt;&lt;td&gt;按 policy 算出来的稳态&lt;/td&gt;&lt;td&gt;不变。这就是「没有人借给我时我该有的值」&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;&lt;code&gt;prio&lt;/code&gt;&lt;/th&gt;&lt;td&gt;通常等于 normal_prio&lt;/td&gt;&lt;td&gt;变成借来的那个更小的数&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;&lt;code&gt;sched_class&lt;/code&gt;&lt;/th&gt;&lt;td&gt;跟 policy&lt;/td&gt;&lt;td&gt;可以从 fair 临时切到 rt（甚至 dl）&lt;/td&gt;&lt;/tr&gt;&lt;/tbody&gt;&lt;/table&gt;&lt;p&gt;生效优先级怎么算：&lt;/p&gt;&lt;section class=&quot;math math-display&quot;&gt;\text{L 的生效 prio} = \min(L.\mathrm{normal\_prio},\; H.\mathrm{prio})&lt;/section&gt;&lt;p&gt;内核轴上数字越小越高，所以 min 就是「取更高的那个」。多个人等同一把锁，只借最高的那一个。&lt;/p&gt;&lt;p&gt;怎么判断正在被抬高？&lt;b&gt;prio 不等于 normal_prio。&lt;/b&gt; 左边是此刻拿去选人的值，右边是自己的稳态。&lt;/p&gt;&lt;hr&gt;&lt;h2 id=&quot;4-一组具体数字走一遍&quot;&gt;4. 一组具体数字走一遍&lt;/h2&gt;&lt;p&gt;继续用上面三个人。记住：用户 FIFO 50 对应内核 prio = 99 - 50 = 49；nice 0 对应 120；nice -5 对应 115。&lt;/p&gt;&lt;div class=&quot;notion-image with-caption&quot;&gt;&lt;img __ASTRO_IMAGE_=&quot;{&amp;#x22;src&amp;#x22;:&amp;#x22;../../assets/images/notion/2fd78e46-6727-4027-8aef-ce34d858a8dd/ee817959-0600-40b1-a9a4-d8b7275c36a2.png&amp;#x22;,&amp;#x22;data-notion-file-type&amp;#x22;:&amp;#x22;file&amp;#x22;,&amp;#x22;index&amp;#x22;:0}&quot;&gt;&lt;div class=&quot;notion-caption&quot;&gt;图5 一组具体数字：L 被抬到 49，再掉回 120&lt;/div&gt;&lt;/div&gt;&lt;p&gt;H 堵上之后：&lt;/p&gt;&lt;section class=&quot;math math-display&quot;&gt;L 的生效 prio = \min(120,\ 49) = 49&lt;/section&gt;&lt;p&gt;L 仍自称 &lt;code&gt;SCHED_NORMAL&lt;/code&gt;、&lt;code&gt;nice&lt;/code&gt; 仍是 0，但调度器已经把它从 &lt;code&gt;CFS&lt;/code&gt; 队列挪到 RT 的 &lt;code&gt;queue[49]&lt;/code&gt;。这段时间它跟真正的 FIFO 50 同一档抢 CPU，所以能压过 M。&lt;/p&gt;&lt;p&gt;L 放锁：没有人再借给它，pi_task 变成空，prio 掉回 120，调度类回到 fair。H 被唤醒，自己跑。M 这才有机会。&lt;/p&gt;&lt;p&gt;&lt;b&gt;两个细节。&lt;/b&gt;&lt;/p&gt;&lt;ol&gt;&lt;li&gt;&lt;u&gt;如果后来又有一个&lt;/u&gt;&lt;u&gt;&lt;code&gt;FIFO 80（内核 prio=19）&lt;/code&gt;&lt;/u&gt;&lt;u&gt;也来等这把锁，L 会被再抬到 19。只看当前最高的等待者。&lt;/u&gt;&lt;/li&gt;&lt;li&gt;&lt;u&gt;&lt;code&gt;fork&lt;/code&gt;&lt;/u&gt;&lt;u&gt; 孩子时故意用 &lt;/u&gt;&lt;u&gt;&lt;code&gt;normal_prio&lt;/code&gt;&lt;/u&gt;&lt;u&gt;，不把临时提权传给孩子。孩子出生时是「自己的稳态」，不是爸爸此刻借来的那个数。&lt;/u&gt;&lt;/li&gt;&lt;/ol&gt;&lt;hr&gt;&lt;h2 id=&quot;5-锁链只抬挡你的人不够&quot;&gt;5. 锁链：只抬挡你的人不够&lt;/h2&gt;&lt;p&gt;更麻烦的情况：H 等 L 的锁 A，L 自己又堵在更低的人 Z 的锁 B 上。只把 L 抬高没有用——L 在睡，CPU 在 Z 手里。&lt;u&gt;&lt;b&gt;必须把 H 的优先级一路传到真正占着 CPU、拿着锁链末端的那个人。&lt;/b&gt;&lt;/u&gt;&lt;/p&gt;&lt;div class=&quot;notion-image with-caption&quot;&gt;&lt;img __ASTRO_IMAGE_=&quot;{&amp;#x22;src&amp;#x22;:&amp;#x22;../../assets/images/notion/2fd78e46-6727-4027-8aef-ce34d858a8dd/3de9f098-7c50-4f0c-b036-83028a079f7d.png&amp;#x22;,&amp;#x22;data-notion-file-type&amp;#x22;:&amp;#x22;file&amp;#x22;,&amp;#x22;index&amp;#x22;:0}&quot;&gt;&lt;div class=&quot;notion-caption&quot;&gt;图4 锁链：借优先级要一路传到真正拿着 CPU 的人&lt;/div&gt;&lt;/div&gt;&lt;p&gt;内核的走法可以记三步：&lt;/p&gt;&lt;ol&gt;&lt;li&gt;H 堵在锁 A 上，把自己登记到「谁在等这把锁」。如果它是这把锁上最高的等待者，就写进 L 的「谁在等我」那棵树。&lt;/li&gt;&lt;li&gt;发现 L 自己也在等另一把锁，就顺着链往下走，把同样的高优先级再借给 Z。&lt;/li&gt;&lt;li&gt;Z 被抬高 → 跑完放 B → L 醒、放 A → H 才能进临界区。&lt;/li&gt;&lt;/ol&gt;&lt;p&gt;这就是 &lt;b&gt;优先级继承链&lt;/b&gt;。顺带也能发现死锁：如果顺着走一圈又回到自己，说明锁互相等，返回死锁错误。链太长会被截断，避免无限走下去。&lt;/p&gt;&lt;hr&gt;&lt;h2 id=&quot;6-什么时候借什么时候还&quot;&gt;6. 什么时候借、什么时候还&lt;/h2&gt;&lt;p&gt;可以按时间顺序记：&lt;/p&gt;&lt;pre&gt;&lt;code class=&quot;language-plain text&quot;&gt;有人来等锁
+  → 若他是这把锁上最高的等待者
+  → 把拿锁的人抬到 min(自己稳态, 等待者 prio)
+  → 拿锁的人若自己也在等锁，继续往下传
+
+拿锁的人放锁
+  → 唤醒最高的等待者
+  → 拿锁的人身上「谁在等我」少了一个
+  → 若没人再等，掉回自己的稳态（de-boost）
+  → 若还有别人等，改借当前剩下的最高者&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;中间那档 M 全程不需要改：它没有拿这把锁，也没有等这把锁。PI 不抬无关的人。&lt;/p&gt;&lt;p&gt;空闲线程一般不会被抬。它关着中断、很快就会走完自己那小段，没有必要真去 boost idle。&lt;/p&gt;&lt;hr&gt;&lt;h2 id=&quot;7-和-cfs-权重不要混&quot;&gt;7. 和 CFS 权重不要混&lt;/h2&gt;&lt;p&gt;boost 不改 se.load，也不走 set_load_weight。原因很简单：L 并没有变成另一个 nice，它只是这段时间要按 RT 的规则插队。&lt;/p&gt;&lt;table&gt;&lt;tbody&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;&lt;/th&gt;&lt;td&gt;改 nice&lt;/td&gt;&lt;td&gt;被 PI boost&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;改的是&lt;/th&gt;&lt;td&gt;身份：static_prio、normal_prio、se.load&lt;/td&gt;&lt;td&gt;生效值：prio，可能换调度类&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;本核怎么选人&lt;/th&gt;&lt;td&gt;仍在 CFS 里，份额变了&lt;/td&gt;&lt;td&gt;切到 RT 后看队列下标，不看 vruntime&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;放锁 / 改回去&lt;/th&gt;&lt;td&gt;nice 改回去，份额跟着改&lt;/td&gt;&lt;td&gt;prio 掉回 normal_prio，再回 CFS，份额还是原来的&lt;/td&gt;&lt;/tr&gt;&lt;/tbody&gt;&lt;/table&gt;&lt;p&gt;所以：一个被抬高的 nice 0 进程，看起来像 FIFO 50 在跑；临界区一结束，它立刻变回那个份额为 1024 的普通任务。负载跟踪（PELT）仍然按它真实跑了多久来记，跟这次临时提权是两件事。&lt;/p&gt;&lt;hr&gt;&lt;h2 id=&quot;8-用户态什么时候会碰到&quot;&gt;8. 用户态什么时候会碰到&lt;/h2&gt;&lt;table&gt;&lt;tbody&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;场景&lt;/th&gt;&lt;td&gt;会不会走 PI&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;&lt;code&gt;pthread_mutex&lt;/code&gt; 默认属性&lt;/th&gt;&lt;td&gt;通常不会。普通 mutex 不继承优先级&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;&lt;code&gt;pthread_mutexattr_setprotocol(PTHREAD_PRIO_INHERIT)&lt;/code&gt;&lt;/th&gt;&lt;td&gt;会。走带 PI 的 futex&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;&lt;code&gt;PTHREAD_PRIO_PROTECT&lt;/code&gt;（优先级天花板）&lt;/th&gt;&lt;td&gt;另一套：拿锁时直接抬到预先设好的天花板，不是向等待者借&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;内核 &lt;code&gt;rt_mutex&lt;/code&gt;；&lt;code&gt;PREEMPT_RT&lt;/code&gt; 上的 &lt;code&gt;spinlock&lt;/code&gt; / &lt;code&gt;mutex&lt;/code&gt;&lt;/th&gt;&lt;td&gt;会。这是内核里真正实现继承的那条路&lt;/td&gt;&lt;/tr&gt;&lt;/tbody&gt;&lt;/table&gt;&lt;p&gt;实时线程和普通线程抢同一把用户态锁时，若没用 &lt;code&gt;INHERIT&lt;/code&gt;，就会出现图 1 那种反转：实时线程干等，普通中优先级一直跑。&lt;/p&gt;&lt;hr&gt;&lt;h2 id=&quot;9-对上代码主流程&quot;&gt;9. 对上代码：主流程&lt;/h2&gt;&lt;p&gt;行号按 &lt;code&gt;linux-source-7.0.0&lt;/code&gt;。前面 H / L / M 的故事，对应的就是下面这条线。&lt;/p&gt;&lt;h3 id=&quot;91-翻代码从哪进&quot;&gt;9.1 翻代码从哪进&lt;/h3&gt;&lt;table&gt;&lt;tbody&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;文件&lt;/th&gt;&lt;td&gt;看什么&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;&lt;code&gt;include/linux/sched.h:1320&lt;/code&gt;&lt;/th&gt;&lt;td&gt;任务上三件套：&lt;code&gt;pi_waiters&lt;/code&gt; / &lt;code&gt;pi_top_task&lt;/code&gt; / &lt;code&gt;pi_blocked_on&lt;/code&gt;&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;&lt;code&gt;kernel/locking/rtmutex.c&lt;/code&gt;&lt;/th&gt;&lt;td&gt;等锁、放锁、锁链。PI 的协议在这里推进&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;&lt;code&gt;kernel/sched/sched.h:4128&lt;/code&gt;&lt;/th&gt;&lt;td&gt;&lt;code&gt;__rt_effective_prio&lt;/code&gt;：min(自己稳态, 借来的 prio)&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;&lt;code&gt;kernel/sched/core.c:7481&lt;/code&gt;&lt;/th&gt;&lt;td&gt;&lt;code&gt;rt_mutex_setprio&lt;/code&gt;：真正改生效 prio、换调度类&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;th scope=&quot;row&quot;&gt;&lt;code&gt;kernel/sched/core.c:4825&lt;/code&gt;&lt;/th&gt;&lt;td&gt;fork 不传 boost：&lt;code&gt;p-&gt;prio = current-&gt;normal_prio&lt;/code&gt;&lt;/td&gt;&lt;/tr&gt;&lt;/tbody&gt;&lt;/table&gt;&lt;p&gt;故事对照：&lt;/p&gt;&lt;pre&gt;&lt;code class=&quot;language-plain text&quot;&gt;H 等锁
+  rt_mutex_slowlock
+    task_blocks_on_rt_mutex()          rtmutex.c:1203  （调用点 :1722）
+      H-&gt;pi_blocked_on = waiter        :1243
+      若 H 是这把锁最高等待者
+        挂进 L-&gt;pi_waiters             :1266-1268
+        rt_mutex_adjust_prio(L)        :1270
+          pi_task = 最高等待者 H       :536-537
+          rt_mutex_setprio(L, H)       :539  /  core.c:7481
+            prio = min(L-&gt;normal_prio, H-&gt;prio)
+            L-&gt;pi_top_task = H
+            可能 fair → rt，写 L-&gt;prio
+      若 L 自己也在等锁
+        rt_mutex_adjust_prio_chain()   :1298   ← 图 4 锁链
+
+L 放锁
+  rt_mutex_slowunlock()                :1411
+    mark_wakeup_next_waiter()          :1312
+      从 L-&gt;pi_waiters 摘掉 H          :1330
+      再 adjust_prio → de-boost L      :1331
+      然后才唤醒 H                     :1354&lt;/code&gt;&lt;/pre&gt;&lt;h3 id=&quot;92-任务上三件套&quot;&gt;9.2 任务上三件套&lt;/h3&gt;&lt;pre&gt;&lt;code class=&quot;language-c&quot;&gt;/* sched.h:1320 */
+struct task_struct {
+// ……
+struct rb_root_cached    pi_waiters;     /* 谁在等我拿着的锁（红黑树，最左是最高） */
+struct task_struct      *pi_top_task;    /* 当前借给我的那个人，对应图 3 */
+struct rt_mutex_waiter  *pi_blocked_on;  /* 我正在等哪把锁 */
+// ……
+}&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;&lt;/p&gt;&lt;p&gt;&lt;code&gt;task_top_pi_waiter()&lt;/code&gt;（&lt;code&gt;rtmutex_common.h:148&lt;/code&gt;）取 &lt;code&gt;pi_waiters&lt;/code&gt; 最左节点，就是「谁在等我」里优先级最高的那个。&lt;/p&gt;&lt;h3 id=&quot;93-h-等锁登记自己必要时抬-l&quot;&gt;9.3 H 等锁：登记自己，必要时抬 L&lt;/h3&gt;&lt;p&gt;调用点在 &lt;code&gt;rt_mutex_slowlock&lt;/code&gt; 里拿不到锁之后（&lt;code&gt;rtmutex.c:1722&lt;/code&gt;）。核心是 &lt;code&gt;task_blocks_on_rt_mutex()&lt;/code&gt;：&lt;/p&gt;&lt;pre&gt;&lt;code class=&quot;language-c&quot;&gt;/* rtmutex.c:1232 */
+waiter-&gt;task = task;
+waiter-&gt;lock = lock;
+rt_mutex_enqueue(lock, waiter);     /* 挂到这把锁的等待树 */
+task-&gt;pi_blocked_on = waiter;       /* H：我在等这把锁 */
+
+/* :1265 只有自己是最高等待者，才去动 owner */
+if (waiter == rt_mutex_top_waiter(lock)) {
+	rt_mutex_enqueue_pi(owner, waiter);  /* 挂进 L-&gt;pi_waiters */
+	rt_mutex_adjust_prio(lock, owner);   /* 抬 L */
+	if (owner-&gt;pi_blocked_on)
+		chain_walk = 1;                 /* L 自己还在等别的锁 → 图 4 */
+}&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;&lt;code&gt;rt_mutex_adjust_prio()&lt;/code&gt; 只做一件事：从 L 的 &lt;code&gt;pi_waiters&lt;/code&gt; 里取出最高等待者，交给 &lt;code&gt;rt_mutex_setprio&lt;/code&gt;。没人等了就传 NULL，等于 de-boost。&lt;/p&gt;&lt;pre&gt;&lt;code class=&quot;language-c&quot;&gt;/* rtmutex.c:527 */
+static void rt_mutex_adjust_prio(struct rt_mutex_base *lock,
+                                 struct task_struct *p)
+{
+	struct task_struct *pi_task = NULL;
+
+	if (task_has_pi_waiters(p))
+		pi_task = task_top_pi_waiter(p)-&gt;task;
+
+	rt_mutex_setprio(p, pi_task);   /* pi_task 就是 donor，图 2 里的 H */
+}&lt;/code&gt;&lt;/pre&gt;&lt;h3 id=&quot;94-真正改数rt_mutex_setprio&quot;&gt;9.4 真正改数：rt_mutex_setprio&lt;/h3&gt;&lt;p&gt;注释写得很直：改 effective priority，&lt;b&gt;不碰&lt;/b&gt; &lt;code&gt;-&gt;normal_prio&lt;/code&gt;。对应第 3 节那两本账。&lt;/p&gt;&lt;pre&gt;&lt;code class=&quot;language-c&quot;&gt;/* core.c:7481 */
+void rt_mutex_setprio(struct task_struct *p, struct task_struct *pi_task)
+{
+	prio = __rt_effective_prio(pi_task, p-&gt;normal_prio);
+	/* sched.h:4128：有 donor 就 min(自己稳态, donor-&gt;prio) */
+
+	p-&gt;pi_top_task = pi_task;     /* 记下借给我的人 */
+	next_class = __setscheduler_class(p-&gt;policy, prio);
+	/* policy 仍是 SCHED_NORMAL，但 prio=49 时 next_class 变成 rt */
+
+	p-&gt;sched_class = next_class;
+	p-&gt;prio = prio;               /* 只写生效值 */
+}&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;&lt;code&gt;__setscheduler_class&lt;/code&gt; 看的是 &lt;b&gt;prio 数字&lt;/b&gt;，不是 policy。所以 L 的身份还是 NORMAL，人已经被挂到 RT 的 &lt;code&gt;queue[49]&lt;/code&gt;。这就是图 3 右边那一栏。&lt;/p&gt;&lt;p&gt;idle 一般不抬（&lt;code&gt;core.c:7540&lt;/code&gt;），对上第 6 节。&lt;/p&gt;&lt;h3 id=&quot;95-l-放锁先-de-boost再唤醒-h&quot;&gt;9.5 L 放锁：先 de-boost，再唤醒 H&lt;/h3&gt;&lt;p&gt;&lt;u&gt;&lt;b&gt;顺序很重要，注释也强调了：必须先从 &lt;/b&gt;&lt;/u&gt;&lt;u&gt;&lt;b&gt;&lt;code&gt;pi_waiters&lt;/code&gt;&lt;/b&gt;&lt;/u&gt;&lt;u&gt;&lt;b&gt; 摘掉 H、把 L 掉回去，再唤醒 H。否则会短暂出现两个人顶着「同一档」优先级。&lt;/b&gt;&lt;/u&gt;&lt;/p&gt;&lt;pre&gt;&lt;code class=&quot;language-c&quot;&gt;/* rtmutex.c:1411 rt_mutex_slowunlock */
+/* 没人等：直接把 owner 清掉就走 */
+/* 还有人等： */
+mark_wakeup_next_waiter(&amp;#x26;wqh, lock);   /* :1466 */
+
+/* mark_wakeup_next_waiter :1312 */
+rt_mutex_dequeue_pi(current, waiter);  /* L-&gt;pi_waiters 去掉 H */
+rt_mutex_adjust_prio(lock, current);   /* 没人借了 → setprio(L, NULL) → 掉回 120 */
+rt_mutex_wake_q_add(wqh, waiter);      /* 这才唤醒 H */&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;H 被唤醒后再次 &lt;code&gt;try_to_take_rt_mutex&lt;/code&gt;（&lt;code&gt;rtmutex.c:1175&lt;/code&gt;）：清掉自己的 &lt;code&gt;pi_blocked_on&lt;/code&gt;，若锁上还有别人等，把新的最高等待者挂到 &lt;b&gt;新 owner（H）&lt;/b&gt; 的 &lt;code&gt;pi_waiters&lt;/code&gt;。继承关系转到下一个人身上。&lt;/p&gt;&lt;p&gt;等锁失败退出走 &lt;code&gt;remove_waiter()&lt;/code&gt;（&lt;code&gt;:1541&lt;/code&gt;）：同样只在自己曾是最高等待者时，才重新 &lt;code&gt;adjust_prio&lt;/code&gt; owner。&lt;/p&gt;&lt;h3 id=&quot;96-fork-不传-boost&quot;&gt;9.6 fork 不传 boost&lt;/h3&gt;&lt;pre&gt;&lt;code class=&quot;language-c&quot;&gt;/* core.c:4822 */
+/* Make sure we do not leak PI boosting priority to the child. */
+p-&gt;prio = current-&gt;normal_prio;&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;故意不用 &lt;code&gt;current-&gt;prio&lt;/code&gt;。对上第 4 节第 2 个细节。&lt;/p&gt;&lt;h3 id=&quot;97-回头怎么翻&quot;&gt;9.7 回头怎么翻&lt;/h3&gt;&lt;ol&gt;&lt;li&gt;先在 &lt;code&gt;rtmutex.c&lt;/code&gt; 搜 &lt;code&gt;task_blocks_on_rt_mutex&lt;/code&gt;，顺着 &lt;code&gt;:1266&lt;/code&gt; 看到 &lt;code&gt;adjust_prio&lt;/code&gt;。&lt;/li&gt;&lt;li&gt;跳到 &lt;code&gt;rt_mutex_setprio&lt;/code&gt;，确认它只写 &lt;code&gt;prio&lt;/code&gt; / &lt;code&gt;sched_class&lt;/code&gt; / &lt;code&gt;pi_top_task&lt;/code&gt;。&lt;/li&gt;&lt;li&gt;放锁搜 &lt;code&gt;mark_wakeup_next_waiter&lt;/code&gt;，看「先 deboost 再 wake」那两行。&lt;/li&gt;&lt;li&gt;锁链搜 &lt;code&gt;rt_mutex_adjust_prio_chain&lt;/code&gt;（&lt;code&gt;:678&lt;/code&gt;），对应图 4。&lt;/li&gt;&lt;li&gt;用 &lt;code&gt;p-&gt;prio != p-&gt;normal_prio&lt;/code&gt; 判断正在被 boost（&lt;code&gt;rt.c&lt;/code&gt; 里也是这么认 RT-boosted）。&lt;/li&gt;&lt;/ol&gt;&lt;h2 id=&quot;小结&quot;&gt;小结&lt;/h2&gt;&lt;pre&gt;&lt;code class=&quot;language-plain text&quot;&gt;反转：H 等锁，L 拿锁，M 抢 CPU  →  H 一直醒不了
+PI：把 H 的 prio 借给 L  →  L 压过 M、放锁  →  H 才能跑
+boost：只改 prio（和调度类），不改 nice / normal_prio / se.load
+判断：prio != normal_prio
+放锁：de-boost，掉回自己的稳态
+fork：孩子拿 normal_prio，不继承这次临时提权
+代码：blocks_on → adjust_prio → setprio；放锁 mark_wakeup_next_waiter 先 deboost 再 wake&lt;/code&gt;&lt;/pre&gt;&lt;p&gt;记住清洁工和 VIP 就够用了：门在清洁工手里时，先让清洁工按 VIP 的待遇把走廊走完；门一开，清洁工还是清洁工。翻代码从第 9 节那张对照表进。&lt;/p&gt;</content:encoded></item><item><title>Tips to improve concentration</title><link>https://yuzhishuo.github.io/blog/improve-concentration</link><guid isPermaLink="true">https://yuzhishuo.github.io/blog/improve-concentration</guid><description>Mindfulness, cognitive training, and a healthy lifestyle may help sharpen your focus.</description><pubDate>Sat, 10 May 2025 00:00:00 GMT</pubDate><content:encoded>&lt;p&gt;import { Aside } from &apos;astro-pure/user&apos;&lt;/p&gt;
+&lt;p&gt;You&apos;re trying to concentrate, but your mind is wandering or you&apos;re easily distracted. What happened to the laser-sharp focus you once enjoyed? As we age, we tend to have more difficulty filtering out stimuli that are not relevant to the task at hand.&lt;/p&gt;
+&lt;h2&gt;What&apos;s fogging up focus?&lt;/h2&gt;
+&lt;p&gt;Like a computer that slows with use, the brain accumulates wear and tear that affects processing. This can be caused by a number of physiological stressors such as inflammation, injury to blood vessels (especially if you have high blood pressure), the buildup of abnormal proteins, and naturally occurring brain shrinkage.&lt;/p&gt;
+&lt;p&gt;The following factors can also affect your concentration.&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;Underlying conditions.&lt;/strong&gt; Depression or sleep disorders (such as sleep apnea) can undermine your ability to concentrate. So can the effects of vision or hearing loss. You waste precious cognitive resources when you spend too much time trying to make out what&apos;s written on a page or just hear what someone is saying.&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;Medication side effects.&lt;/strong&gt; Some drugs, especially anticholinergics (such as treatments for incontinence, depression, or allergies), can slow processing speed and your ability to think clearly.&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;Excessive drinking.&lt;/strong&gt; Having too much alcohol impairs thinking and causes interrupted sleep, which affects concentration.&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;Information overload.&lt;/strong&gt; We are bombarded with information from TVs, computers, and messages such as texts or emails. When there&apos;s too much material, it burdens our filtering system and it&apos;s easy to get distracted.&lt;/p&gt;
+&lt;h2&gt;Strategies to stay focused&lt;/h2&gt;
+&lt;p&gt;To improve attention, consider the following strategies.&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;Mindfulness.&lt;/strong&gt; &quot;Mindfulness is about focusing attention on the present moment, and practicing mindfulness has been shown to rewire the brain so that attention is stronger in everyday life,&quot; says Kim Willment, a neuropsychologist with Brigham and Women&apos;s Hospital. She recommends sitting still for a few minutes each day, closing your eyes, and focusing on your breathing as well as the sounds and sensations around you.&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;Cognitive training.&lt;/strong&gt; Computerized cognitive training games aim to improve your response times and attention. Evidence that this works has been mixed. &quot;The goal of playing these games is not to get better at them, but to get better in the cognitive activities of everyday life,&quot; Willment says. &quot;But there is evidence that a person&apos;s ability to pay attention can be improved by progressively pushing the person to higher levels of performance. So if you reach a certain level of sustained attention, pushing it to the next level can help improve it, and this may translate to everyday life.&quot;&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;A healthier lifestyle.&lt;/strong&gt; Many aspects of a healthy lifestyle can help attention, starting with sleep and exercise. There is a direct link between exercise and cognitive ability, especially attention. When you exercise, you increase the availability of brain chemicals that promote new brain connections, reduce stress, and improve sleep. And when we sleep, we reduce stress hormones that can be harmful to the brain, and we clear out proteins that injure it.&lt;/p&gt;
+&lt;p&gt;Aim for seven to eight hours of sleep each night, and 150 minutes per week of aerobic exercise, such as brisk walking.&lt;/p&gt;
+&lt;p&gt;Other healthy steps to improve focus: eat a Mediterranean-style diet, which has been shown to support brain health; treat underlying conditions; and change medications that may be affecting your ability to focus.&lt;/p&gt;
+&lt;p&gt;Getting older is out of your control, but healthier living is something you determine, and it may improve concentration.&lt;/p&gt;
+&lt;blockquote&gt;
+&lt;p&gt;Article from: &lt;a href=&quot;https://www.health.harvard.edu/mind-and-mood/tips-to-improve-concentration&quot;&gt;Harvard Health Publishing&lt;/a&gt;&lt;/p&gt;
+&lt;/blockquote&gt;</content:encoded><h:img src="/_astro/thumbnail.1GZ294Dz.jpg"/><enclosure url="/_astro/thumbnail.1GZ294Dz.jpg"/></item><item><title>Using MDX</title><link>https://yuzhishuo.github.io/blog/using-mdx</link><guid isPermaLink="true">https://yuzhishuo.github.io/blog/using-mdx</guid><description>Learning how to use MDX in Astro</description><pubDate>Sun, 01 Jun 2025 00:00:00 GMT</pubDate><content:encoded>&lt;p&gt;This theme comes with the &lt;a href=&quot;https://docs.astro.build/en/guides/integrations-guide/mdx/&quot;&gt;@astrojs/mdx&lt;/a&gt; integration installed and configured in your &lt;code&gt;astro.config.ts&lt;/code&gt; config file. If you prefer not to use MDX, you can disable support by removing the integration from your config file.&lt;/p&gt;
+&lt;h2&gt;Why MDX?&lt;/h2&gt;
+&lt;p&gt;MDX is a special flavor of Markdown that supports embedded JavaScript &amp;#x26; JSX syntax. This unlocks the ability to &lt;a href=&quot;https://docs.astro.build/en/guides/markdown-content/#mdx-features&quot;&gt;mix JavaScript and UI Components into your Markdown content&lt;/a&gt; for things like interactive charts or alerts.&lt;/p&gt;
+&lt;p&gt;If you have existing content authored in MDX, this integration will hopefully make migrating to Astro a breeze.&lt;/p&gt;
+&lt;h2&gt;Example&lt;/h2&gt;
+&lt;p&gt;Here is how you import and use a UI component inside of MDX.&lt;br&gt;
+When you open this page in the browser, you should see the clickable button below.&lt;/p&gt;
+&lt;p&gt;import { Button } from &apos;astro-pure/user&apos;&lt;/p&gt;
+&lt;p&gt;Click Me&lt;/p&gt;
+&lt;h2&gt;More Links&lt;/h2&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;a href=&quot;https://mdxjs.com/docs/what-is-mdx&quot;&gt;MDX Syntax Documentation&lt;/a&gt;&lt;/li&gt;
+&lt;li&gt;&lt;a href=&quot;https://docs.astro.build/en/guides/markdown-content/#markdown-and-mdx-pages&quot;&gt;Astro Usage Documentation&lt;/a&gt;&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;Note:&lt;/strong&gt; &lt;a href=&quot;https://docs.astro.build/en/reference/directives-reference/#client-directives&quot;&gt;Client Directives&lt;/a&gt; are still required to create interactive components. Otherwise, all components in your MDX will render as static HTML (no JavaScript) by default.&lt;/li&gt;
+&lt;/ul&gt;</content:encoded></item><item><title>What Is 3D Rendering? Complete Guide to 3D Visualization</title><link>https://yuzhishuo.github.io/blog/3d-rendering</link><guid isPermaLink="true">https://yuzhishuo.github.io/blog/3d-rendering</guid><description>3D imagery has the power to bring cinematic visions to life and help accurately plan tomorrow’s cityscapes. Here, 3D expert Ricardo Ortiz explains how it works.</description><pubDate>Sun, 09 Feb 2025 00:00:00 GMT</pubDate><content:encoded>&lt;p&gt;3D rendering is all around us. From huge action movies to car commercials to previews of upcoming buildings or product designs, 3D visualization has become so widespread and realistic that you probably don’t even know it’s there.&lt;/p&gt;
+&lt;p&gt;In this introductory piece, Chaos’ Ricardo Ortiz explains the basics of 3D rendering, from the computational methods that create imagery to the artistic techniques that create great computer-generated (CG) content and its various uses.&lt;/p&gt;
+&lt;h2&gt;What is 3D Rendering?&lt;/h2&gt;
+&lt;p&gt;Put simply, 3D rendering is the process of using a computer to generate a 2D image from a digital three-dimensional scene.&lt;/p&gt;
+&lt;p&gt;To generate an image, specific methodologies and special software and hardware are used. Therefore, we need to understand that 3D rendering is a process—the one that builds the image.&lt;/p&gt;
+&lt;p&gt;&lt;img src=&quot;https://yuzhishuo.github.io/_astro/nikola-arsov-still-life-interior-design-vray-3ds-max-05-930px.DoY3_oVo_alYGQ.webp&quot; alt=&quot;alt text&quot;&gt;&lt;/p&gt;
+&lt;h2&gt;Types of 3D rendering&lt;/h2&gt;
+&lt;p&gt;We can create different types of rendered image; they can be realistic or non-realistic.&lt;/p&gt;
+&lt;p&gt;A realistic image could be an architectural interior that looks like a photograph, a product-design image such as a piece of furniture, or an automotive rendering of a car. On the other hand, we can create a non-realistic image such as an outline-type diagram or a cartoon-style image with a traditional 2D look. Technically, we can visualize anything we can imagine.&lt;/p&gt;
+&lt;h2&gt;How is 3D rendering used?&lt;/h2&gt;
+&lt;p&gt;3D rendering is an essential technique for many industries including architecture, product design, advertising, video games and visual effects for film, TV and animation.&lt;/p&gt;
+&lt;p&gt;In design and architecture, renders allow creative people to communicate their ideas in a clear and transparent way. A render gives them the chance to evaluate their proposals, experiment with materials, conduct studies and contextualize their designs in the real world before they are built or manufactured.&lt;/p&gt;
+&lt;p&gt;For the media and entertainment industries, 3D rendering is fundamental to the creation of sequences and animations that tell stories, whether we’re watching an animated movie, a period drama, or an action sequence with explosions, ships from the future, exotic locales, or extraterrestrial creatures.&lt;/p&gt;
+&lt;p&gt;&lt;img src=&quot;https://yuzhishuo.github.io/_astro/thanos-dd-single-image-004a.DUX4VGf-_1A3bTN.webp&quot; alt=&quot;alt text&quot;&gt;&lt;/p&gt;
+&lt;p&gt;Over the past few years, the evolution of computer graphics in these industries has replaced traditional techniques. For example, special effects are being replaced by visual effects, which means stunt people no longer risk their lives in car crashes.&lt;/p&gt;
+&lt;p&gt;In advertising, I would dare to say that 90% of automotive commercials are CG—or even more. In the architecture industry, many traditional techniques to create representations, such as scale models, have been replaced with photorealistic imagery to ensure we can see exactly how something will look once it’s built.&lt;/p&gt;
+&lt;p&gt;Accelerating processes, reducing costs and the demand for better quality results have helped technology evolve. Hardware is more powerful than ever and the switch to CG was inevitable.&lt;/p&gt;
+&lt;h2&gt;How is a 3D rendered image generated?&lt;/h2&gt;
+&lt;p&gt;Two pieces of software, with different characteristics, are used to computer-generate images and animations: render engines and game engines. Render engines use a technique called ray tracing, while game engines use a technique called rasterization—and some engines mix both techniques, but we will talk about that later on.&lt;/p&gt;</content:encoded><h:img src="/_astro/thumbnail.DzZDiYKA.jpg"/><enclosure url="/_astro/thumbnail.DzZDiYKA.jpg"/></item><item><title>The Impact of Technology on the Music World</title><link>https://yuzhishuo.github.io/blog/music-journey</link><guid isPermaLink="true">https://yuzhishuo.github.io/blog/music-journey</guid><description>The evolution of music is a symphony of creativity, rhythm, and technology.</description><pubDate>Sat, 30 Nov 2024 00:00:00 GMT</pubDate><content:encoded>&lt;p&gt;The evolution of music is a symphony of creativity, rhythm, and technology. From the humble beginnings of acoustic instruments to the present-day digital era, the relationship between music and technology has been transformative. In this article, we will explore the historical milestones, digital revolution, and emerging technologies that have shaped the music world. Join us on a journey through the chords of innovation as we discuss how technology has changed music.&lt;/p&gt;
+&lt;h2&gt;Historical Perspective&lt;/h2&gt;
+&lt;p&gt;The marriage of music and technology dates back centuries, with pivotal moments shaping the industry. The invention of the phonograph by Thomas Edison in the late 19th century marked the first time music could be recorded and replayed. Subsequent milestones, such as the electric guitar and the synthesizer, revolutionized music creation, paving the way for new genres and sounds.&lt;/p&gt;
+&lt;p&gt;These technological leaps didn&apos;t merely shape the musical landscape of their time but laid a foundation for the continuous evolution of the intersection between music and technology. As artists embraced these innovations, they unlocked new avenues for creativity, paving the way for diverse sounds and genres that have become integral to the vibrant tapestry of the modern music industry. The historical perspective illuminates the symbiotic relationship between music and technology, highlighting the transformative impact that each innovation has had on the way we create, consume, and experience music.&lt;/p&gt;
+&lt;h2&gt;Digital Revolution&lt;/h2&gt;
+&lt;p&gt;The digital revolution has been a seismic shift in the music industry, altering how music is consumed, distributed, and produced. The transition from physical formats like CDs and vinyl to digital formats such as MP3s and streaming services has democratized access to music. The ease of streaming has transformed how listeners discover and enjoy music, challenging traditional revenue models while offering unparalleled convenience.&lt;/p&gt;
+&lt;h2&gt;Technology in Music Consumption and Distribution&lt;/h2&gt;
+&lt;p&gt;Streaming services have become the heartbeat of music consumption, causing a decline in traditional music stores. The accessibility of music online has reshaped distribution channels, impacting both artists and record labels. While it provides exposure to a global audience, it also poses challenges regarding fair compensation for artists. The dynamics of the industry are evolving, reflecting the intricate dance between technology and music.
+Music Production and Creation&lt;/p&gt;
+&lt;p&gt;The advent of digital audio workstations (DAWs), software instruments, and electronic production techniques has democratized music creation. Artists now have powerful tools at their fingertips, enabling them to experiment with sounds, collaborate remotely, and produce music independently. This technological shift has broken down barriers, allowing for a diverse array of voices to be heard in the ever-expanding realm of music.&lt;/p&gt;</content:encoded><h:img src="/_astro/thumbnail.Cx18cRmB.jpg"/><enclosure url="/_astro/thumbnail.Cx18cRmB.jpg"/></item><item><title>Markdown Syntax Support</title><link>https://yuzhishuo.github.io/blog/markdown</link><guid isPermaLink="true">https://yuzhishuo.github.io/blog/markdown</guid><description>Markdown is a lightweight markup language.</description><pubDate>Wed, 26 Jul 2023 08:00:00 GMT</pubDate><content:encoded>&lt;h2&gt;Basic Syntax&lt;/h2&gt;
+&lt;p&gt;Markdown is a lightweight and easy-to-use syntax for styling your writing.&lt;/p&gt;
+&lt;h3&gt;Headers&lt;/h3&gt;
+&lt;p&gt;When the content of the article is extensive, you can use headers to segment:&lt;/p&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;# Header 1
+
+## Header 2
+
+## Large Header
+
+### Small Header
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Header previews would disrupt the structure of the article, so they are not displayed here.&lt;/p&gt;
+&lt;h3&gt;Bold and Italics&lt;/h3&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;_Italic text_ and **Bold text**, together will be **_Bold Italic text_**
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Preview:&lt;/p&gt;
+&lt;p&gt;&lt;em&gt;Italic text&lt;/em&gt; and &lt;strong&gt;Bold text&lt;/strong&gt;, together will be &lt;strong&gt;&lt;em&gt;Bold Italic text&lt;/em&gt;&lt;/strong&gt;&lt;/p&gt;
+&lt;h3&gt;Links&lt;/h3&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;Text link [Link Name](http://link-url)
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Preview:&lt;/p&gt;
+&lt;p&gt;Text link &lt;a href=&quot;http://link-url&quot;&gt;Link Name&lt;/a&gt;&lt;/p&gt;
+&lt;h3&gt;Inline Code&lt;/h3&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;This is an `inline code`
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Preview:&lt;/p&gt;
+&lt;p&gt;This is an &lt;code&gt;inline code&lt;/code&gt;&lt;/p&gt;
+&lt;h3&gt;Code Blocks&lt;/h3&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;```js
+// calculate fibonacci
+function fibonacci(n) {
+  if (n &amp;#x3C;= 1) return 1
+  const result = fibonacci(n - 1) + fibonacci(n - 2) // [\!code --]
+  return fibonacci(n - 1) + fibonacci(n - 2) // [\!code ++]
+}
+```
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Preview:&lt;/p&gt;
+&lt;pre&gt;&lt;code class=&quot;language-js&quot;&gt;// calculate fibonacci
+function fibonacci(n) {
+  if (n &amp;#x3C;= 1) return 1
+  const result = fibonacci(n - 1) + fibonacci(n - 2) // [!code --]
+  return fibonacci(n - 1) + fibonacci(n - 2) // [!code ++]
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Currently using shiki as the code highlighting plugin. For supported languages, refer to &lt;a href=&quot;https://shiki.matsu.io/languages.html&quot;&gt;Shiki: Languages&lt;/a&gt;.&lt;/p&gt;
+&lt;h3&gt;Inline Formula&lt;/h3&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;This is an inline formula $e^{i\pi} + 1 = 0$
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Preview:&lt;/p&gt;
+&lt;p&gt;This is an inline formula $e^{i\pi} + 1 = 0$&lt;/p&gt;
+&lt;h3&gt;Formula Blocks&lt;/h3&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;$$
+\hat{f}(\xi) = \int_{-\infty}^{\infty} f(x) e^{-2\pi i x \xi} \, dx
+$$
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Preview:&lt;/p&gt;
+&lt;p&gt;$$
+\hat{f}(\xi) = \int_{-\infty}^{\infty} f(x) e^{-2\pi i x \xi} , dx
+$$&lt;/p&gt;
+&lt;p&gt;Currently using KaTeX as the math formula plugin. For supported syntax, refer to &lt;a href=&quot;https://katex.org/docs/supported.html&quot;&gt;KaTeX Supported Functions&lt;/a&gt;.&lt;/p&gt;
+&lt;h4&gt;Images&lt;/h4&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;![CWorld](/favicon/favicon.ico)
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Preview:&lt;/p&gt;
+&lt;p&gt;&lt;img src=&quot;/favicon/favicon.ico&quot; alt=&quot;CWorld&quot;&gt;&lt;/p&gt;
+&lt;h4&gt;Strikethrough&lt;/h4&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;~~Strikethrough~~
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Preview:&lt;/p&gt;
+&lt;p&gt;~~Strikethrough~~&lt;/p&gt;
+&lt;h3&gt;Lists&lt;/h3&gt;
+&lt;p&gt;Regular unordered list&lt;/p&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;- 1
+- 2
+- 3
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Preview:&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;1&lt;/li&gt;
+&lt;li&gt;2&lt;/li&gt;
+&lt;li&gt;3&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;Regular ordered list&lt;/p&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;1. GPT-4
+2. Claude Opus
+3. LLaMa
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Preview:&lt;/p&gt;
+&lt;ol&gt;
+&lt;li&gt;GPT-4&lt;/li&gt;
+&lt;li&gt;Claude Opus&lt;/li&gt;
+&lt;li&gt;LLaMa&lt;/li&gt;
+&lt;/ol&gt;
+&lt;p&gt;You can continue to nest syntax within lists.&lt;/p&gt;
+&lt;h3&gt;Blockquotes&lt;/h3&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;&gt; Gunshot, thunder, sword rise. A scene of flowers and blood.
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Preview:&lt;/p&gt;
+&lt;blockquote&gt;
+&lt;p&gt;Gunshot, thunder, sword rise. A scene of flowers and blood.&lt;/p&gt;
+&lt;/blockquote&gt;
+&lt;p&gt;You can continue to nest syntax within blockquotes.&lt;/p&gt;
+&lt;h3&gt;Line Breaks&lt;/h3&gt;
+&lt;p&gt;Markdown needs a blank line to separate paragraphs.&lt;/p&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;If you don&apos;t leave a blank line
+it will be in one paragraph
+
+First paragraph
+
+Second paragraph
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Preview:&lt;/p&gt;
+&lt;p&gt;If you don&apos;t leave a blank line
+it will be in one paragraph&lt;/p&gt;
+&lt;p&gt;First paragraph&lt;/p&gt;
+&lt;p&gt;Second paragraph&lt;/p&gt;
+&lt;h3&gt;Separators&lt;/h3&gt;
+&lt;p&gt;If you have the habit of writing separators, you can start a new line and enter three dashes &lt;code&gt;---&lt;/code&gt; or asterisks &lt;code&gt;***&lt;/code&gt;. Leave a blank line before and after when there are paragraphs:&lt;/p&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;---
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Preview:&lt;/p&gt;
+&lt;hr&gt;
+&lt;h2&gt;Advanced Techniques&lt;/h2&gt;
+&lt;h3&gt;Inline HTML Elements&lt;/h3&gt;
+&lt;p&gt;Currently, only some inline HTML elements are supported, including &lt;code&gt;&amp;#x3C;kdb&gt; &amp;#x3C;b&gt; &amp;#x3C;i&gt; &amp;#x3C;em&gt; &amp;#x3C;sup&gt; &amp;#x3C;sub&gt; &amp;#x3C;br&gt;&lt;/code&gt;, such as&lt;/p&gt;
+&lt;h4&gt;Key Display&lt;/h4&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;Use &amp;#x3C;kbd&gt;Ctrl&amp;#x3C;/kbd&gt; + &amp;#x3C;kbd&gt;Alt&amp;#x3C;/kbd&gt; + &amp;#x3C;kbd&gt;Del&amp;#x3C;/kbd&gt; to reboot the computer
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Preview:&lt;/p&gt;
+&lt;p&gt;Use Ctrl + Alt + Del to reboot the computer&lt;/p&gt;
+&lt;h4&gt;Bold Italics&lt;/h4&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;&amp;#x3C;b&gt; Markdown also applies here, such as _bold_ &amp;#x3C;/b&gt;
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Preview:&lt;/p&gt;
+&lt;p&gt; Markdown also applies here, such as &lt;em&gt;bold&lt;/em&gt; &lt;/p&gt;
+&lt;h3&gt;Other HTML Writing&lt;/h3&gt;
+&lt;h4&gt;Foldable Blocks&lt;/h4&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;&amp;#x3C;details&gt;&amp;#x3C;summary&gt;Click to expand&amp;#x3C;/summary&gt;It is hidden&amp;#x3C;/details&gt;
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Preview:&lt;/p&gt;
+&lt;h3&gt;Tables&lt;/h3&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;| Header1  | Header2  |
+| -------- | -------- |
+| Content1 | Content2 |
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Preview:&lt;/p&gt;
+&lt;p&gt;| Header1  | Header2  |
+| -------- | -------- |
+| Content1 | Content2 |&lt;/p&gt;
+&lt;h3&gt;Footnotes&lt;/h3&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;Use [^footnote] to add a footnote at the point of reference.
+
+Then, at the end of the document, add the content of the footnote (it will be rendered at the end of the article by default).
+
+[^footnote]: Here is the content of the footnote
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Preview:&lt;/p&gt;
+&lt;p&gt;Use [^footnote] to add a footnote at the point of reference.&lt;/p&gt;
+&lt;p&gt;Then, at the end of the document, add the content of the footnote (it will be rendered at the end of the article by default).&lt;/p&gt;
+&lt;p&gt;[^footnote]: Here is the content of the footnote&lt;/p&gt;
+&lt;h3&gt;To-Do Lists&lt;/h3&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;- [ ] Incomplete task
+- [x] Completed task
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Preview:&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;[ ] Incomplete task&lt;/li&gt;
+&lt;li&gt;[x] Completed task&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h3&gt;Symbol Escaping&lt;/h3&gt;
+&lt;p&gt;If you need to use markdown symbols like _ # * in your description but don&apos;t want them to be escaped, you can add a backslash before these symbols, such as &lt;code&gt;\_&lt;/code&gt; &lt;code&gt;\#&lt;/code&gt; &lt;code&gt;\*&lt;/code&gt; to avoid it.&lt;/p&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;\_Don&apos;t want the text here to be italic\_
+
+\*\*Don&apos;t want the text here to be bold\*\*
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Preview:&lt;/p&gt;
+&lt;p&gt;_Don&apos;t want the text here to be italic_&lt;/p&gt;
+&lt;p&gt;**Don&apos;t want the text here to be bold**&lt;/p&gt;
+&lt;hr&gt;
+&lt;h2&gt;Embedding Astro Components&lt;/h2&gt;
+&lt;p&gt;See &lt;a href=&quot;/docs/integrations/components&quot;&gt;User Components&lt;/a&gt; and &lt;a href=&quot;/docs/integrations/advanced&quot;&gt;Advanced Components&lt;/a&gt; for details.&lt;/p&gt;</content:encoded><h:img src="/_astro/thumbnail.HAXFr_hw.jpg"/><enclosure url="/_astro/thumbnail.HAXFr_hw.jpg"/></item><item><title>Markdown 语法支持</title><link>https://yuzhishuo.github.io/blog/markdown-zh</link><guid isPermaLink="true">https://yuzhishuo.github.io/blog/markdown-zh</guid><description>Markdown 是一种轻量级的「标记语言」。</description><pubDate>Wed, 26 Jul 2023 08:00:00 GMT</pubDate><content:encoded>&lt;h2&gt;基本语法&lt;/h2&gt;
+&lt;p&gt;Markdown 是一种轻量级且易于使用的语法，用于为您的写作设计风格。&lt;/p&gt;
+&lt;h3&gt;标题&lt;/h3&gt;
+&lt;p&gt;文章内容较多时，可以用标题分段：&lt;/p&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;# 标题 1
+
+## 标题 2
+
+## 大标题
+
+### 小标题
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;标题预览会打乱文章的结构，所以在此不展示。&lt;/p&gt;
+&lt;h3&gt;粗斜体&lt;/h3&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;_斜体文本_
+
+**粗体文本**
+
+**_粗斜体文本_**
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;预览：&lt;/p&gt;
+&lt;p&gt;&lt;em&gt;斜体文本&lt;/em&gt;&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;粗体文本&lt;/strong&gt;&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;&lt;em&gt;粗斜体文本&lt;/em&gt;&lt;/strong&gt;&lt;/p&gt;
+&lt;h3&gt;链接&lt;/h3&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;文字链接 [链接名称](http://链接网址)
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;预览：&lt;/p&gt;
+&lt;p&gt;文字链接 &lt;a href=&quot;http://%E9%93%BE%E6%8E%A5%E7%BD%91%E5%9D%80&quot;&gt;链接名称&lt;/a&gt;&lt;/p&gt;
+&lt;h3&gt;行内代码&lt;/h3&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;这是一条 `单行代码`
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;预览：&lt;/p&gt;
+&lt;p&gt;这是一条 &lt;code&gt;行内代码&lt;/code&gt;&lt;/p&gt;
+&lt;h3&gt;代码块&lt;/h3&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;```js
+// calculate fibonacci
+function fibonacci(n) {
+  if (n &amp;#x3C;= 1) return 1
+  return fibonacci(n - 1) + fibonacci(n - 2)
+}
+```
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;预览：&lt;/p&gt;
+&lt;pre&gt;&lt;code class=&quot;language-js&quot;&gt;// calculate fibonacci
+function fibonacci(n) {
+  if (n &amp;#x3C;= 1) return 1
+  return fibonacci(n - 1) + fibonacci(n - 2)
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;当前使用 shiki 作为代码高亮插件，支持的语言请参考 &lt;a href=&quot;https://shiki.matsu.io/languages.html&quot;&gt;shiki / languages&lt;/a&gt;。&lt;/p&gt;
+&lt;h3&gt;行内公式&lt;/h3&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;这是一条行内公式 $e^{i\pi} + 1 = 0$
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;预览：&lt;/p&gt;
+&lt;p&gt;这是一条行内公式 $e^{i\pi} + 1 = 0$&lt;/p&gt;
+&lt;h3&gt;公式块&lt;/h3&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;$$
+\hat{f}(\xi) = \int_{-\infty}^{\infty} f(x) e^{-2\pi i x \xi} \, dx
+$$
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;预览：&lt;/p&gt;
+&lt;p&gt;$$
+\hat{f}(\xi) = \int_{-\infty}^{\infty} f(x) e^{-2\pi i x \xi} , dx
+$$&lt;/p&gt;
+&lt;p&gt;当前使用 KaTeX 作为数学公式插件，支持的语法请参考 &lt;a href=&quot;https://katex.org/docs/supported.html&quot;&gt;KaTeX Supported Functions&lt;/a&gt;。&lt;/p&gt;
+&lt;h4&gt;图片&lt;/h4&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;![CWorld](/favicon/favicon.ico)
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;预览：&lt;/p&gt;
+&lt;p&gt;&lt;img src=&quot;/favicon/favicon.ico&quot; alt=&quot;CWorld&quot;&gt;&lt;/p&gt;
+&lt;h4&gt;删除线&lt;/h4&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;~~删除线~~
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;预览：&lt;/p&gt;
+&lt;p&gt;~~删除线~~&lt;/p&gt;
+&lt;h3&gt;列表&lt;/h3&gt;
+&lt;p&gt;普通无序列表&lt;/p&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;- 1
+- 2
+- 3
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;预览：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;1&lt;/li&gt;
+&lt;li&gt;2&lt;/li&gt;
+&lt;li&gt;3&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;普通有序列表&lt;/p&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;1. GPT-4
+2. Claude Opus
+3. LLaMa
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;预览：&lt;/p&gt;
+&lt;ol&gt;
+&lt;li&gt;GPT-4&lt;/li&gt;
+&lt;li&gt;Claude Opus&lt;/li&gt;
+&lt;li&gt;LLaMa&lt;/li&gt;
+&lt;/ol&gt;
+&lt;p&gt;列表里可以继续嵌套语法&lt;/p&gt;
+&lt;h3&gt;引用&lt;/h3&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;&gt; 枪响，雷鸣，剑起。繁花血景。
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;预览：&lt;/p&gt;
+&lt;blockquote&gt;
+&lt;p&gt;枪响，雷鸣，剑起。繁花血景。&lt;/p&gt;
+&lt;/blockquote&gt;
+&lt;p&gt;引用里也可以继续嵌套语法。&lt;/p&gt;
+&lt;h3&gt;换行&lt;/h3&gt;
+&lt;p&gt;markdown 分段落是需要空一行的。&lt;/p&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;如果不空行
+就会在一段
+
+第一段
+
+第二段
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;预览：&lt;/p&gt;
+&lt;p&gt;如果不空行
+就会在一段&lt;/p&gt;
+&lt;p&gt;第一段&lt;/p&gt;
+&lt;p&gt;第二段&lt;/p&gt;
+&lt;h3&gt;分隔符&lt;/h3&gt;
+&lt;p&gt;如果你有写分割线的习惯，可以新起一行输入三个减号&lt;code&gt;---&lt;/code&gt; 或者星号 &lt;code&gt;***&lt;/code&gt;。当前后都有段落时，请空出一行：&lt;/p&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;---
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;预览：&lt;/p&gt;
+&lt;hr&gt;
+&lt;h2&gt;高级技巧&lt;/h2&gt;
+&lt;h3&gt;行内 HTML 元素&lt;/h3&gt;
+&lt;p&gt;目前只支持部分段内 HTML 元素效果，包括 &lt;code&gt;&amp;#x3C;kdb&gt; &amp;#x3C;b&gt; &amp;#x3C;i&gt; &amp;#x3C;em&gt; &amp;#x3C;sup&gt; &amp;#x3C;sub&gt; &amp;#x3C;br&gt;&lt;/code&gt; ，如&lt;/p&gt;
+&lt;h4&gt;键位显示&lt;/h4&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;使用 &amp;#x3C;kbd&gt;Ctrl&amp;#x3C;/kbd&gt; + &amp;#x3C;kbd&gt;Alt&amp;#x3C;/kbd&gt; + &amp;#x3C;kbd&gt;Del&amp;#x3C;/kbd&gt; 重启电脑
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;预览：&lt;/p&gt;
+&lt;p&gt;使用 Ctrl + Alt + Del 重启电脑&lt;/p&gt;
+&lt;h4&gt;粗斜体&lt;/h4&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;&amp;#x3C;b&gt; Markdown 在此处同样适用，如 _加粗_ &amp;#x3C;/b&gt;
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;预览：&lt;/p&gt;
+&lt;p&gt; Markdown 在此处同样适用，如 &lt;em&gt;加粗&lt;/em&gt; &lt;/p&gt;
+&lt;h3&gt;其他 HTML 写法&lt;/h3&gt;
+&lt;h4&gt;折叠块&lt;/h4&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;&amp;#x3C;details&gt;&amp;#x3C;summary&gt;点击展开&amp;#x3C;/summary&gt;它被隐藏了&amp;#x3C;/details&gt;
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;预览：&lt;/p&gt;
+&lt;h3&gt;表格&lt;/h3&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;| 表头1 | 表头2 |
+| ----- | ----- |
+| 内容1 | 内容2 |
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;预览：&lt;/p&gt;
+&lt;p&gt;| 表头1 | 表头2 |
+| ----- | ----- |
+| 内容1 | 内容2 |&lt;/p&gt;
+&lt;h3&gt;注释&lt;/h3&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;在引用的地方使用 [^注释] 来添加注释。
+
+然后在文档的结尾，添加注释的内容（会默认于文章结尾渲染之）。
+
+[^注释]: 这里是注释的内容
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;预览：&lt;/p&gt;
+&lt;p&gt;在引用的地方使用 &lt;a href=&quot;%E8%BF%99%E9%87%8C%E6%98%AF%E6%B3%A8%E9%87%8A%E7%9A%84%E5%86%85%E5%AE%B9&quot;&gt;^注释&lt;/a&gt; 来添加注释。&lt;/p&gt;
+&lt;p&gt;然后在文档的结尾，添加注释的内容（会默认于文章结尾渲染之）。&lt;/p&gt;
+&lt;h3&gt;To-Do 列表&lt;/h3&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;- [ ] 未完成的任务
+- [x] 已完成的任务
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;预览：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;[ ] 未完成的任务&lt;/li&gt;
+&lt;li&gt;[x] 已完成的任务&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h3&gt;符号转义&lt;/h3&gt;
+&lt;p&gt;如果你的描述中需要用到 markdown 的符号，比如 _ # * 等，但又不想它被转义，这时候可以在这些符号前加反斜杠，如 &lt;code&gt;\_&lt;/code&gt; &lt;code&gt;\#&lt;/code&gt; &lt;code&gt;\*&lt;/code&gt; 进行避免。&lt;/p&gt;
+&lt;pre&gt;&lt;code class=&quot;language-markdown&quot;&gt;\_不想这里的文本变斜体\_
+
+\*\*不想这里的文本被加粗\*\*
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;预览：&lt;/p&gt;
+&lt;p&gt;_不想这里的文本变斜体_&lt;/p&gt;
+&lt;p&gt;**不想这里的文本被加粗**&lt;/p&gt;
+&lt;hr&gt;
+&lt;h2&gt;内嵌 Astro 组件&lt;/h2&gt;
+&lt;p&gt;See &lt;a href=&quot;/docs/integrations/components&quot;&gt;User Components&lt;/a&gt; and &lt;a href=&quot;/docs/integrations/advanced&quot;&gt;Advanced Components&lt;/a&gt; for details.&lt;/p&gt;</content:encoded><h:img src="/_astro/thumbnail.HAXFr_hw.jpg"/><enclosure url="/_astro/thumbnail.HAXFr_hw.jpg"/></item></channel></rss>
